@@ -1,0 +1,66 @@
+# =============================================================================
+# Single source of truth for the PBM binding predictor.
+#
+# Every path, hyperparameter, and architectural choice lives here so that
+# changing the model is a config edit, not a code change. The file is loaded
+# and validated into the `Config` dataclass in src/config.py.
+# =============================================================================
+
+seed: 42
+
+paths:
+  data_dir: ./data
+  artifacts_dir: ./artifacts
+  train_dbps: ./data/training_DBPs.txt
+  train_seqs: ./data/training_seqs.txt
+  # The provided zip contains a single file `training_data.txt` of shape
+  # [30000 probes x 400 proteins] (one line per probe, one value per protein).
+  # io.load_intensities transposes it to [n_proteins, n_probes].
+  train_intensities: ./data/training_data.zip
+  test_dbps: ./data/test_DBPs.txt
+  test_seqs: ./data/test_seqs.txt
+  embeddings_cache: ./artifacts/protein_embeddings.npz
+  model_ckpt: ./artifacts/model.pt
+
+protein_encoder:
+  type: esm2                          # esm2 | learned
+  esm_model: facebook/esm2_t12_35M_UR50D   # 35M params -> 480-d embeddings (default)
+  pooling: mean                       # mean | cls
+  max_len: 1022                       # ESM-2 token limit; all proteins fit (max 832)
+  freeze: true                        # freeze ESM; only the projection MLP trains
+  proj_dim: 128
+
+dna_encoder:
+  # NOTE: a cheap ablation (8 epochs, 150 proteins) suggested RC hurts, but the
+  # full-scale comparison flipped: RC ON = 0.5906 vs RC OFF = 0.5761 val Pearson.
+  # At full training scale RC averaging acts as useful augmentation, so we keep
+  # it ON. (Lesson: validate config changes at full scale, not just a proxy.)
+  use_reverse_complement: true        # run fwd + reverse-complement through shared CNN
+  rc_combine: mean                    # mean | max
+  conv_channels: 128
+  kernel_sizes: [9, 15, 21]           # list -> parallel multi-width convolutions
+  proj_dim: 128
+  dropout: 0.2
+
+head:
+  type: concat_product                # concat | concat_product | bilinear | film
+  hidden_dim: 128
+  dropout: 0.2
+
+target:
+  log1p: true
+  per_protein_zscore: true
+
+train:
+  val_protein_fraction: 0.1           # protein-disjoint split (no protein in both)
+  probes_per_protein_per_epoch: 3000  # per-epoch subsample of the 30k probes
+  batch_size: 512
+  epochs: 30
+  lr: 0.001
+  weight_decay: 0.0001
+  loss: mse                           # mse | huber | pearson
+  early_stopping_patience: 6
+  num_workers: 0                      # DataLoader workers (0 is safest on Windows)
+
+predict:
+  batch_size: 4096

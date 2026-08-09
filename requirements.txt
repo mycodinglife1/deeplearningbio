@@ -1,0 +1,8 @@
+# Core dependencies for the PBM binding predictor.
+# Versions are lower bounds known to work; newer minor versions are fine.
+torch>=2.0
+numpy>=1.24
+scipy>=1.10            # only used in evaluation / tests for a Pearson cross-check
+pyyaml>=6.0
+transformers>=4.30     # only needed OFFLINE to precompute ESM-2 protein embeddings
+pytest>=7.0            # test suite
