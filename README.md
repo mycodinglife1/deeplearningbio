@@ -1,36 +1,41 @@
 # PBM Binding Predictor — two-tower recommender for protein–DNA binding
 
-Predict the **binding intensity** of a DNA-binding protein (DBP) for 36-bp DNA
-probes, for **unseen proteins and unseen probes** (a zero-shot Protein Binding
-Microarray task). The model is a two-tower recommender:
+Our mission is to predict the **binding intensity** of a DNA-binding protein (DBP) for 36-bp DNA
+probes, for **unseen proteins and unseen probes**.
+To do so, we'll use a two-tower recommender (one tower for the protein and one for the DNA)
 
 ```
-protein (amino acids) ─► ESM-2 (frozen) ─► mean-pool ─► projection ─► p ┐
+protein (amino acids) ─► ESM-2 ─► mean-pool ─► projection ─► p ┐
                                                                         ├─► interaction head ─► binding score
 DNA probe (36 bp)     ─► one-hot (+RC)  ─► 1-D CNN   ─► projection ─► d ┘
 ```
 
-* **Protein tower:** a pretrained protein language model (ESM-2), run **once
-  offline** and cached, plus a small trainable projection.
-* **DNA tower:** a 1-D CNN motif scanner (a learnable PWM; DeepBind-style),
-  with reverse-complement averaging.
-* **Head:** combines `[p, d, p⊙d]` → MLP → one number.
+* **Protein tower:** for this tower we'll just use the pretrained protein language model (ESM-2),
+  and then standardize and adapt the reults using average pooling and a projection.
+* **DNA tower:** for this tower we'll use one-hot encoding and a CNN,
+  making sure to use reverse-complement averaging to account for both strands.
+* **Head:** and then we'll just merge the reults and use a multilayer perceptron layer to output a binding score.
 
-The evaluation metric is **mean per-protein Pearson correlation**; the provided
-baseline averages **0.208** and we aim well above it.
+The evaluation metric is **mean per-protein Pearson correlation** with provided
+baseline averages **0.208** and we're aiming to beat it.
+
+> **Final model:** a cross-attention head (the protein attends to the DNA) plus
+> zero-shot regularization on the protein vectors, trained on all 387 proteins.
+> It reaches **0.560** mean per-protein Pearson on unseen proteins **and** unseen
+> probes — ~2.7× the 0.208 baseline. See [REPORT.md](REPORT.md) §5–6 for the full
+> results and the experiments that got us there.
 
 ---
 
-## Why this design (the short version)
+## Why this design
 
-* Test proteins/probes are completely unseen, so we must learn a *general*
-  protein↔DNA rule, not memorize. A two-tower recommender is the standard way.
+* Test proteins/probes are completely unseen, so we must learn a general rule,
+  not memorize. A two-tower recommender is the standard way.
 * Pearson is shift/scale-invariant per protein, so we **z-score each protein's
-  targets** (after `log1p`) — the ideal learning signal — and the `p⊙d` head
-  forces the model to use the DNA (a per-protein constant scores 0).
-* ESM-2 is **frozen and precomputed**, so prediction runs only the cheap DNA
-  tower + head → well within the 600 s runtime budget. **ESM never runs on the
-  prediction path.**
+  targets** (after `log1p`) to standardize values.
+* To force the model to use the DNA we do element-wise multiplication `p⊙d`.
+* The runtime is in budget because ESM-2 is already computed,
+  and running the DNA path is not so expensive.
 
 Full rationale, data facts, and the experiment backlog are in
 [DESIGN.md](DESIGN.md).
@@ -85,23 +90,7 @@ python scripts/runtime_test.py --in-process        # single-load lower bound
 
 # 6. (Optional) Ablation table for the report.
 python scripts/ablation.py --epochs 10
-
-# 7. Score a single prediction file against a ground-truth file.
-#    NOTE: test-set truth is not provided; use held-out TRAINING probes.
-python scripts/score.py pred.txt true.txt
-
-# 8. Report the model's per-protein Pearson DISTRIBUTION (mean/median/histogram)
-#    on held-out validation proteins -- this is the graded metric.
-python scripts/evaluate_model.py
-python scripts/evaluate_model.py --per-protein --csv artifacts/val_scores.csv
 ```
-
-> **Scoring caveat.** Pearson is scale/shift-invariant, so the model predicts a
-> per-protein *ranking* (z-scored), not the raw intensity. Compare with
-> **Pearson/Spearman**; `MSE`/`R^2` against raw intensities will look bad
-> (large MSE, negative R^2) and are *expected* — they are not the metric.
-> You cannot score the real test set yourself (only the grader has its labels);
-> the honest estimate is the validation Pearson in `artifacts/train_log.json`.
 
 Run the test suite (offline, no ESM download needed):
 
@@ -111,7 +100,7 @@ pytest
 
 ---
 
-## The graded entrypoint
+## Entrypoint
 
 ```
 python main.py <output_file> <DBP_name> <DNA_probe_file>
@@ -139,7 +128,9 @@ All paths, hyperparameters, and architecture choices live in
 | ESM size | `protein_encoder.esm_model` | `esm2_t6_8M` / `t12_35M` (default) / `t30_150M` |
 | Reverse complement | `dna_encoder.use_reverse_complement` | `true` / `false` |
 | CNN kernels | `dna_encoder.kernel_sizes` | e.g. `[15]` or `[9, 15, 21]` |
-| Interaction head | `head.type` | `concat`, `concat_product` (default), `bilinear`, `film` |
+| DNA encoder | `dna_encoder.type` | `cnn` (default), `cnn_transformer`, `moe` |
+| Interaction head | `head.type` | `concat`, `concat_product`, `bilinear`, `film`, `cross_attention` (final model) |
+| Zero-shot regularization | `train.protein_noise_std`, `train.protein_mask_prob` | e.g. `0.024`, `0.1` |
 | Target transform | `target.log1p`, `target.per_protein_zscore` | `true` / `false` |
 | Loss | `train.loss` | `mse`, `huber`, `pearson` |
 

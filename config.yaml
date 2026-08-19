@@ -47,9 +47,12 @@ dna_encoder:
   dropout: 0.2
 
 head:
-  type: concat_product                # concat | concat_product | bilinear | film
+  # Final model: cross-attention head (protein attends to per-position DNA).
+  # Improved doubly-disjoint Pearson 0.520 -> 0.560 over the concat_product head.
+  type: cross_attention               # concat | concat_product | bilinear | film | cross_attention
   hidden_dim: 128
   dropout: 0.2
+  attn_heads: 4
 
 target:
   log1p: true
@@ -63,6 +66,10 @@ train:
   lr: 0.001
   weight_decay: 0.0001
   loss: mse                           # mse | huber | pearson
+  # Zero-shot regularization on protein vectors (final model): prevents
+  # memorizing the ~387 training proteins -> better generalization to unseen.
+  protein_noise_std: 0.0241           # Gaussian noise added to protein vectors while training
+  protein_mask_prob: 0.1              # randomly zero this fraction of protein dims
   early_stopping_patience: 6
   num_workers: 0                      # DataLoader workers (0 is safest on Windows)
 

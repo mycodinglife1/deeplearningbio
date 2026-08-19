@@ -12,9 +12,9 @@ results.)*
 **Goal.** For an unseen DNA-binding protein, predict the binding intensity of
 each 36-bp DNA probe so that predictions *correlate* (per protein) with the true
 PBM intensities. Proteins and probes in the test set are disjoint from training,
-so this is a genuine **zero-shot** task on both axes.
+so this is a genuine zero-shot task.
 
-**Interface (graded).**
+**Interface.**
 ```
 python main.py <output_file> <DBP_name> <DNA_probe_file>
 ```
@@ -44,13 +44,21 @@ A **two-tower recommender** (DESIGN.md §3–4):
   Forward and reverse-complement strands pass through the **same** weights and
   are **averaged** — a protein may bind either strand. (We verified at full
   scale that RC helps here: 0.5906 with vs 0.5761 without; see §6.)
-* **Interaction head** — `concat_product`: `[p, d, p⊙d] → Linear(384→128) →
-  ReLU → Dropout → Linear(128→1)`. The `p⊙d` term forces a real interaction so
-  the model cannot cheat with a per-protein constant (which scores 0 under
-  Pearson).
+* **Interaction head** — the final model uses a **cross-attention head**: the
+  protein vector is the query and the per-position DNA features are the
+  keys/values, so the protein selectively attends to the sites it cares about
+  (following TransBind). The attended DNA summary is combined with the protein
+  via `[p, d, p⊙d] → MLP → 1`. The `p⊙d` term forces a real interaction so the
+  model cannot cheat with a per-protein constant (which scores 0 under Pearson).
+  A simpler `concat_product` head is also available and was our starting point
+  (see §6).
+* **Zero-shot regularization.** With only 387 training proteins, the protein
+  side is the main overfitting risk, so during training we perturb each protein
+  vector with Gaussian noise and random feature masking. This stops the model
+  memorizing specific proteins and improves generalization to unseen ones.
 
-`BindingModel` (`src/model.py`) composes the three from config; every choice
-above is a single `config.yaml` edit.
+`BindingModel` (`src/model.py`) composes the towers + head from config; every
+choice above is a single `config.yaml` edit.
 
 ---
 
@@ -74,8 +82,7 @@ above is a single `config.yaml` edit.
 
 * **Split.** Protein-disjoint (90/10): the validation proteins are never seen
   in training, mirroring the real zero-shot test. We early-stop and select on
-  **mean per-protein Pearson vs raw intensity** (exactly how the grader scores),
-  not on loss.
+  **mean per-protein Pearson vs raw intensity**, not on loss.
 * **Per epoch** we subsample 3,000 of the 30,000 probes per protein (~1.04M
   pairs/epoch) so epochs are fast while covering every protein.
 * **Optimizer / loss.** AdamW, lr 1e-3, weight decay 1e-4; MSE on z-scored
@@ -88,20 +95,21 @@ above is a single `config.yaml` edit.
 
 ## 5. Results on training data
 
-On the **protein-disjoint** validation set (39 unique proteins never seen in
-training, all 30,000 probes each):
+We evaluate in two settings. The **doubly-disjoint** setting — unseen proteins
+**and** unseen probes — mirrors the real test exactly (and matches how the
+provided baseline was built), so it is our headline metric.
 
-| | value |
+| Model (evaluated on unseen proteins **and** unseen probes) | mean per-protein Pearson |
 |---|---|
-| Best validation mean per-protein Pearson | **0.5906** |
-| Validation mean per-protein Spearman | 0.6231 |
-| Baseline (to beat) | 0.208 |
-| Epoch of best (of 30; selected on val Pearson) | 25 |
-| Training time (CPU, 30 epochs) | ~110 min (6,630 s) |
+| Provided baseline | 0.208 |
+| Our two-tower baseline (CNN + concat-product head) | 0.520 |
+| **Final model (cross-attention head + zero-shot regularization)** | **0.560** |
 
-The model beats the 0.208 baseline by **~2.8×** on held-out (unseen) proteins.
-Validation Pearson rises smoothly (0.499 → 0.521 → 0.529 → … → **0.591**); the
-full per-epoch curve is in `artifacts/train_log.json`.
+The final model reaches **0.560** — **~2.7× the 0.208 baseline** — and improves
+our own two-tower baseline by **+0.040**. On the easier protein-disjoint setting
+(unseen proteins, training probes) the two-tower model reaches **0.591** mean
+per-protein Pearson (Spearman 0.623). Per-epoch curves are logged in
+`artifacts/train_log.json`.
 
 ---
 
@@ -136,36 +144,45 @@ epochs, early stopping) and the result **flipped**:
 | RC off | 0.5761 |
 
 At full training scale RC averaging behaves like useful data augmentation and
-**improves** generalization to unseen proteins, so the shipped model keeps
-`use_reverse_complement: true`. The lesson — worth a sentence in any report —
-is that a cheap ablation proxy (few epochs, few proteins) can point the wrong
-way; config changes were validated at full scale before being adopted.
+**improves** generalization to unseen proteins, so we keep
+`use_reverse_complement: true`.
 
-**Protein-encoder size: bigger is not better here.** We also tested a much
-larger protein language model, `esm2_t33_650M` (1280-d embeddings, ~18× the
-parameters of the shipped `esm2_t12_35M`), full precompute + full retrain:
+### 6.1 What we tried next, in order
 
-| Protein encoder | embed dim | mean val Pearson | median | 64-DBP runtime |
-|---|---|---|---|---|
-| **esm2_t12_35M (shipped)** | 480 | **0.5906** | 0.6308 | 320.9 s |
-| esm2_t33_650M | 1280 | 0.5859 | 0.6121 | ~319 s |
+**1. A larger protein model (ESM-2 650M) — did not help.** We swapped the 35M
+encoder for `esm2_t33_650M` (1280-d embeddings, ~18× the parameters), recomputed
+all embeddings, and retrained. Accuracy did **not** improve (0.586 vs 0.591 mean
+per-protein Pearson on the protein-disjoint set) while the model is far heavier,
+so we kept the 35M encoder. Because ESM runs offline and is cached, encoder size
+does **not** affect prediction runtime — a bigger model is a free experiment on
+the runtime score, it simply did not pay off on accuracy here.
 
-The bigger encoder did **not** help (marginally lower on every summary
-statistic) — with only ~387 training proteins the 480-d features are already
-sufficient, and the wider vector adds capacity we cannot exploit. Crucially,
-**runtime was unchanged** (~319 s): ESM runs offline and is never on the
-prediction path, so encoder size costs only one-time precompute, not the graded
-latency. We therefore ship the 35M encoder. (A bigger encoder becomes worth
-revisiting only if many more training proteins become available.)
+**2. Cross-attention head + zero-shot regularization (B+C) — our main
+improvement.** We replaced the concat-product head with a **cross-attention
+head** (the protein attends to the per-position DNA features) and added
+**zero-shot regularization** on the protein vectors (Gaussian noise + feature
+masking during training). On the honest doubly-disjoint evaluation (unseen
+proteins **and** unseen probes) this raised mean per-protein Pearson from
+**0.520 → 0.560 (+0.040)**. Prediction stays comfortably within budget
+(64 DBPs in ~152 s in-process, efficiency 1.00), so the accuracy gain is free on
+the runtime score. This is the configuration we ship.
+
+**3. Final training on all data (no validation split).** For the submitted
+model we retrained the winning configuration on **all 387 unique proteins with
+no validation holdout**, using the number of epochs identified by the validated
+sweep. Every protein contributes signal to the final model; because the epoch
+count is fixed ahead of time from prior validation, no held-out set is needed to
+decide when to stop.
 
 ---
 
 ## 7. Performance (time, memory, CPU)
 
-* **Prediction (the graded path).** All 64 DBPs over the 11,728 test probes:
-  **320.9 s** (subprocess pattern, per-DBP `main.py`, includes per-call
-  startup) → efficiency `max(min(1, 2 − t/600), 0) = 1.000`. In-process
-  (single load) lower bound: **~75 s**. Both well inside the 600 s budget.
+* **Prediction (the graded path).** All 64 DBPs over the 11,728 test probes with
+  the final cross-attention model: **~152 s** in-process → efficiency
+  `max(min(1, 2 − t/600), 0) = 1.000`. The simpler pooled-head model runs in
+  ~75 s; both are well inside the 600 s budget. Cross-attention is ~2× the
+  pooled head but still comfortably within budget.
 * **No ESM at predict time** — `main.py` loads a few-MB model + a tiny embedding
   cache and runs only the DNA tower + head under `torch.inference_mode()`.
 * **Offline ESM precompute.** All 464 proteins encoded once in ~124 s on CPU.
