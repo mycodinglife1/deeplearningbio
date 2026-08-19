@@ -54,8 +54,12 @@ class BindingModel(nn.Module):
         self.use_reverse_complement = use_reverse_complement
         self.rc_combine = rc_combine
 
+    @property
+    def _head_needs_positions(self) -> bool:
+        return getattr(self.head, "needs_positions", False)
+
     def encode_dna(self, dna_onehot: torch.Tensor) -> torch.Tensor:
-        """Encode DNA, optionally averaging/maxing forward & reverse-complement.
+        """Encode DNA to a pooled vector, optionally combining fwd & RC strands.
 
         Both strands pass through the *same* weights (a protein may bind either
         strand, and the array reports only one).
@@ -68,10 +72,29 @@ class BindingModel(nn.Module):
             return torch.maximum(d, d_rc)
         return 0.5 * (d + d_rc)
 
+    def encode_dna_positions(self, dna_onehot: torch.Tensor) -> torch.Tensor:
+        """Per-position DNA features for the cross-attention head: [N, L', kv_dim].
+
+        With reverse complement on, both strands' positions are concatenated so
+        the protein query can attend to sites on either strand.
+        """
+        pos = self.dna_encoder.position_features(dna_onehot)
+        if not self.use_reverse_complement:
+            return pos
+        pos_rc = self.dna_encoder.position_features(reverse_complement_onehot(dna_onehot))
+        return torch.cat([pos, pos_rc], dim=1)                 # [N, 2L, kv_dim]
+
+    def _score(self, p: torch.Tensor, dna_onehot: torch.Tensor) -> torch.Tensor:
+        """Shared scoring: route pooled vs per-position DNA to the head."""
+        if self._head_needs_positions:
+            d_pos = self.encode_dna_positions(dna_onehot)      # [N, L', kv_dim]
+            return self.head(p, d_pos)
+        d = self.encode_dna(dna_onehot)                        # [N, proj_dim]
+        return self.head(p, d)
+
     def forward(self, protein_input: torch.Tensor, dna_onehot: torch.Tensor) -> torch.Tensor:
         p = self.protein_encoder(protein_input)   # [N, proj_dim]
-        d = self.encode_dna(dna_onehot)            # [N, proj_dim]
-        return self.head(p, d)                     # [N]
+        return self._score(p, dna_onehot)         # [N]
 
     @torch.inference_mode()
     def predict_for_protein(self,
@@ -84,9 +107,8 @@ class BindingModel(nn.Module):
         """
         self.eval()
         p = self.protein_encoder(protein_vec.unsqueeze(0))     # [1, proj_dim]
-        d = self.encode_dna(dna_onehot_batch)                  # [B, proj_dim]
-        p = p.expand(d.shape[0], -1)                           # [B, proj_dim]
-        return self.head(p, d)                                 # [B]
+        p = p.expand(dna_onehot_batch.shape[0], -1)            # [B, proj_dim]
+        return self._score(p, dna_onehot_batch)                # [B]
 
 
 def build_model(cfg: Config, protein_input_dim: Optional[int] = None) -> BindingModel:
@@ -97,7 +119,8 @@ def build_model(cfg: Config, protein_input_dim: Optional[int] = None) -> Binding
     """
     protein_encoder = build_protein_encoder(cfg.protein_encoder, input_dim=protein_input_dim)
     dna_encoder = build_dna_encoder(cfg.dna_encoder)
-    head = build_head(cfg.head, proj_dim=dna_encoder.output_dim)
+    kv_dim = getattr(dna_encoder, "position_dim", None)
+    head = build_head(cfg.head, proj_dim=dna_encoder.output_dim, kv_dim=kv_dim)
     return BindingModel(
         protein_encoder=protein_encoder,
         dna_encoder=dna_encoder,

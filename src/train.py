@@ -108,22 +108,32 @@ def evaluate_val(model: nn.Module,
     """
     model.eval()
     n_probes = dna_onehot.shape[0]
-
-    # Encode all probes once (batched to bound memory).
-    d_chunks = []
-    for start in range(0, n_probes, predict_batch_size):
-        chunk = dna_onehot[start:start + predict_batch_size].to(device)
-        d_chunks.append(model.encode_dna(chunk).cpu())
-    d_all = torch.cat(d_chunks, dim=0)                       # [n_probes, proj_dim]
-
     preds: Dict[int, np.ndarray] = {}
     trues: Dict[int, np.ndarray] = {}
-    for pid in val_ids:
-        p = model.protein_encoder(protein_bank[pid:pid + 1].to(device)).cpu()  # [1, proj]
-        p_exp = p.expand(n_probes, -1)
-        scores = model.head(p_exp, d_all).numpy()
-        preds[int(pid)] = scores
-        trues[int(pid)] = raw_intensities[pid]
+
+    # Pooled heads let us encode DNA once and reuse it across proteins. The
+    # cross-attention head needs per-position DNA + the protein together, so we
+    # score it per protein (still cheap: the DNA tower dominates and is small).
+    if not getattr(model.head, "needs_positions", False):
+        d_chunks = []
+        for start in range(0, n_probes, predict_batch_size):
+            chunk = dna_onehot[start:start + predict_batch_size].to(device)
+            d_chunks.append(model.encode_dna(chunk).cpu())
+        d_all = torch.cat(d_chunks, dim=0)                       # [n_probes, proj_dim]
+        for pid in val_ids:
+            p = model.protein_encoder(protein_bank[pid:pid + 1].to(device)).cpu()
+            scores = model.head(p.expand(n_probes, -1), d_all).numpy()
+            preds[int(pid)] = scores
+            trues[int(pid)] = raw_intensities[pid]
+    else:
+        for pid in val_ids:
+            vec = protein_bank[pid].to(device)
+            scores = []
+            for start in range(0, n_probes, predict_batch_size):
+                chunk = dna_onehot[start:start + predict_batch_size].to(device)
+                scores.append(model.predict_for_protein(vec, chunk).cpu())
+            preds[int(pid)] = torch.cat(scores).numpy()
+            trues[int(pid)] = raw_intensities[pid]
 
     return {
         "pearson": pearson_per_protein(preds, trues),
@@ -152,6 +162,30 @@ def _batch_pearson_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tenso
     tgt_c = target - target.mean()
     denom = torch.sqrt((pred_c ** 2).sum() * (tgt_c ** 2).sum()) + 1e-8
     return 1.0 - (pred_c * tgt_c).sum() / denom
+
+
+def apply_protein_regularization(vecs: torch.Tensor,
+                                 noise_std: float,
+                                 mask_prob: float,
+                                 training: bool) -> torch.Tensor:
+    """Zero-shot regularization (C): perturb protein vectors during training only.
+
+    * Gaussian noise (``noise_std``): the model never sees the exact same protein
+      vector twice, so it cannot memorize a specific (rare) training protein.
+    * Feature masking (``mask_prob``): randomly zero a fraction of the vector's
+      dimensions so no single protein feature is over-relied on.
+
+    Both are no-ops at eval time and when their strengths are 0.
+    """
+    if not training:
+        return vecs
+    if noise_std > 0.0:
+        vecs = vecs + torch.randn_like(vecs) * noise_std
+    if mask_prob > 0.0:
+        keep = (torch.rand_like(vecs) >= mask_prob).float()
+        # Scale up survivors (inverted dropout) so the expected magnitude holds.
+        vecs = vecs * keep / (1.0 - mask_prob)
+    return vecs
 
 
 # ---------------------------------------------------------------------------
@@ -203,13 +237,20 @@ def train(cfg: Config,
     # --- one-hot all DNA once -------------------------------------------
     dna_onehot = torch.from_numpy(one_hot_batch(probes))      # [n_probes, 4, 36]
 
-    # --- protein-disjoint split -----------------------------------------
-    train_ids, val_ids = protein_disjoint_split(len(uniq_seqs),
-                                                cfg.train.val_protein_fraction, cfg.seed)
+    # --- protein split (or use ALL proteins for the final model) --------
+    # val_protein_fraction <= 0 => train on every protein, keep the last epoch
+    # (the epoch count is chosen ahead of time from a validated sweep).
+    if cfg.train.val_protein_fraction <= 0:
+        train_ids = np.arange(len(uniq_seqs))
+        val_ids = np.array([], dtype=int)
+    else:
+        train_ids, val_ids = protein_disjoint_split(len(uniq_seqs),
+                                                    cfg.train.val_protein_fraction, cfg.seed)
     if max_train_proteins is not None:
         train_ids = train_ids[:max_train_proteins]
         val_ids = val_ids[:max(2, max_train_proteins // 4)]
-    logger.info(f"Split: {len(train_ids)} train proteins, {len(val_ids)} val proteins")
+    logger.info(f"Split: {len(train_ids)} train proteins, {len(val_ids)} val proteins"
+                + (" (ALL data; keeping final epoch)" if len(val_ids) == 0 else ""))
 
     # --- model / optimizer ----------------------------------------------
     model = build_model(cfg, protein_input_dim=protein_input_dim).to(device)
@@ -234,12 +275,16 @@ def train(cfg: Config,
         ds = FlatPairDataset(prot_idx, probe_idx, dna_onehot.cpu().numpy()
                              if device.type != "cpu" else dna_onehot.numpy(),
                              targets_norm)
-        loader = build_dataloader(ds, cfg.train.batch_size, shuffle=True,
+        shuffle = not cfg.train.single_protein_batches
+        loader = build_dataloader(ds, cfg.train.batch_size, shuffle=shuffle,
                                   num_workers=cfg.train.num_workers)
 
         running, n_batches = 0.0, 0
         for prot_b, dna_b, target_b in loader:
             protein_vecs = protein_bank[prot_b.to(device)]
+            protein_vecs = apply_protein_regularization(
+                protein_vecs, cfg.train.protein_noise_std,
+                cfg.train.protein_mask_prob, training=True)
             dna_b = dna_b.to(device)
             target_b = target_b.to(device)
 
@@ -252,6 +297,17 @@ def train(cfg: Config,
             n_batches += 1
 
         train_loss = running / max(1, n_batches)
+
+        if len(val_ids) == 0:
+            # All-data mode: no validation; always keep the latest epoch.
+            history.append({"epoch": epoch, "train_loss": train_loss,
+                            "val_pearson": float("nan"), "val_spearman": float("nan")})
+            if not quiet:
+                logger.info(f"epoch {epoch:3d} | train_loss {train_loss:.4f} | (all-data, no val)")
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_pearson = float("nan")
+            continue
+
         val = evaluate_val(model, protein_bank, dna_onehot, uniq_raw, val_ids,
                            device, cfg.predict.batch_size)
         history.append({"epoch": epoch, "train_loss": train_loss,

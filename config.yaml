@@ -24,7 +24,11 @@ paths:
 
 protein_encoder:
   type: esm2                          # esm2 | learned
-  esm_model: facebook/esm2_t12_35M_UR50D   # 35M params -> 480-d embeddings (default)
+  # We tested esm2_t33_650M (1280-d): it did NOT improve val Pearson (0.5859 vs
+  # 0.5906) and is far heavier, so we ship the 35M model. Runtime is unaffected
+  # by ESM size (ESM is offline-only), so a bigger model is a free option to
+  # re-try if more training proteins become available.
+  esm_model: facebook/esm2_t12_35M_UR50D   # 35M params -> 480-d embeddings (shipped)
   pooling: mean                       # mean | cls
   max_len: 1022                       # ESM-2 token limit; all proteins fit (max 832)
   freeze: true                        # freeze ESM; only the projection MLP trains

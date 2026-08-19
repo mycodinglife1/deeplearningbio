@@ -85,7 +85,23 @@ python scripts/runtime_test.py --in-process        # single-load lower bound
 
 # 6. (Optional) Ablation table for the report.
 python scripts/ablation.py --epochs 10
+
+# 7. Score a single prediction file against a ground-truth file.
+#    NOTE: test-set truth is not provided; use held-out TRAINING probes.
+python scripts/score.py pred.txt true.txt
+
+# 8. Report the model's per-protein Pearson DISTRIBUTION (mean/median/histogram)
+#    on held-out validation proteins -- this is the graded metric.
+python scripts/evaluate_model.py
+python scripts/evaluate_model.py --per-protein --csv artifacts/val_scores.csv
 ```
+
+> **Scoring caveat.** Pearson is scale/shift-invariant, so the model predicts a
+> per-protein *ranking* (z-scored), not the raw intensity. Compare with
+> **Pearson/Spearman**; `MSE`/`R^2` against raw intensities will look bad
+> (large MSE, negative R^2) and are *expected* — they are not the metric.
+> You cannot score the real test set yourself (only the grader has its labels);
+> the honest estimate is the validation Pearson in `artifacts/train_log.json`.
 
 Run the test suite (offline, no ESM download needed):
 

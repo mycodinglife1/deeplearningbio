@@ -141,6 +141,23 @@ At full training scale RC averaging behaves like useful data augmentation and
 is that a cheap ablation proxy (few epochs, few proteins) can point the wrong
 way; config changes were validated at full scale before being adopted.
 
+**Protein-encoder size: bigger is not better here.** We also tested a much
+larger protein language model, `esm2_t33_650M` (1280-d embeddings, ~18× the
+parameters of the shipped `esm2_t12_35M`), full precompute + full retrain:
+
+| Protein encoder | embed dim | mean val Pearson | median | 64-DBP runtime |
+|---|---|---|---|---|
+| **esm2_t12_35M (shipped)** | 480 | **0.5906** | 0.6308 | 320.9 s |
+| esm2_t33_650M | 1280 | 0.5859 | 0.6121 | ~319 s |
+
+The bigger encoder did **not** help (marginally lower on every summary
+statistic) — with only ~387 training proteins the 480-d features are already
+sufficient, and the wider vector adds capacity we cannot exploit. Crucially,
+**runtime was unchanged** (~319 s): ESM runs offline and is never on the
+prediction path, so encoder size costs only one-time precompute, not the graded
+latency. We therefore ship the 35M encoder. (A bigger encoder becomes worth
+revisiting only if many more training proteins become available.)
+
 ---
 
 ## 7. Performance (time, memory, CPU)

@@ -16,6 +16,10 @@ import torch.nn as nn
 class ConcatHead(nn.Module):
     """``[p, d] -> MLP -> 1`` (simplest; good ablation baseline)."""
 
+    # Heads that consume the *pooled* DNA vector set this False; the
+    # cross-attention head needs the per-position DNA map instead.
+    needs_positions = False
+
     def __init__(self, dim: int, hidden_dim: int, dropout: float):
         super().__init__()
         self.mlp = _mlp(2 * dim, hidden_dim, dropout)
@@ -68,6 +72,38 @@ class FiLMHead(nn.Module):
         return self.mlp(modulated).squeeze(-1)
 
 
+class CrossAttentionHead(nn.Module):
+    """Protein attends to the per-position DNA map, then predicts a score (B).
+
+    The protein vector ``p`` is the query; the DNA position features are the
+    keys/values, so ``p`` selectively "scans" the probe for the sites it cares
+    about (the TransBind idea). The attended DNA summary is combined with ``p``
+    via the same concat+product interaction before the final MLP.
+    """
+
+    needs_positions = True
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float,
+                 kv_dim: int, attn_heads: int = 4):
+        super().__init__()
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(kv_dim, dim)
+        self.v_proj = nn.Linear(kv_dim, dim)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=attn_heads,
+                                          dropout=dropout, batch_first=True)
+        self.mlp = _mlp(3 * dim, hidden_dim, dropout)
+
+    def forward(self, p: torch.Tensor, d_positions: torch.Tensor) -> torch.Tensor:
+        # p: [N, dim];  d_positions: [N, L, kv_dim]
+        q = self.q_proj(p).unsqueeze(1)                 # [N, 1, dim]
+        k = self.k_proj(d_positions)                    # [N, L, dim]
+        v = self.v_proj(d_positions)                    # [N, L, dim]
+        attended, _ = self.attn(q, k, v)                # [N, 1, dim]
+        d = attended.squeeze(1)                         # [N, dim]
+        combined = torch.cat([p, d, p * d], dim=1)      # [N, 3*dim]
+        return self.mlp(combined).squeeze(-1)
+
+
 def _mlp(in_dim: int, hidden_dim: int, dropout: float) -> nn.Sequential:
     """Shared 2-layer MLP: ``in_dim -> hidden -> 1`` with ReLU + dropout."""
     return nn.Sequential(
@@ -86,8 +122,18 @@ _HEADS = {
 }
 
 
-def build_head(cfg, proj_dim: int) -> nn.Module:
-    """Factory selecting the head class by ``head.type``. Output shape ``[N]``."""
+def build_head(cfg, proj_dim: int, kv_dim: int | None = None) -> nn.Module:
+    """Factory selecting the head class by ``head.type``. Output shape ``[N]``.
+
+    ``kv_dim`` is the DNA per-position feature dim, required only by the
+    cross-attention head.
+    """
+    if cfg.type == "cross_attention":
+        if kv_dim is None:
+            raise ValueError("cross_attention head requires kv_dim (DNA position_dim).")
+        return CrossAttentionHead(dim=proj_dim, hidden_dim=cfg.hidden_dim,
+                                  dropout=cfg.dropout, kv_dim=kv_dim,
+                                  attn_heads=cfg.attn_heads)
     if cfg.type not in _HEADS:
-        raise ValueError(f"Unknown head.type={cfg.type!r}; choices={list(_HEADS)}")
+        raise ValueError(f"Unknown head.type={cfg.type!r}; choices={list(_HEADS) + ['cross_attention']}")
     return _HEADS[cfg.type](dim=proj_dim, hidden_dim=cfg.hidden_dim, dropout=cfg.dropout)

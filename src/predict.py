@@ -77,15 +77,16 @@ def predict(model: BindingModel,
         protein_vec = torch.as_tensor(protein_vec, dtype=torch.float32)
     protein_vec = protein_vec.to(device).float()
 
-    # Project the protein once and reuse across all probe batches.
+    # Project the protein once and reuse across all probe batches. Routing
+    # through model._score handles every head type, including the
+    # cross-attention head that needs per-position DNA features.
     p = model.protein_encoder(protein_vec.unsqueeze(0))     # [1, proj_dim]
 
     onehot = one_hot_batch(dna_seqs)                         # [N, 4, L]
     scores: List[float] = []
     for start in range(0, len(dna_seqs), batch_size):
         batch = torch.from_numpy(onehot[start:start + batch_size]).to(device)
-        d = model.encode_dna(batch)                          # [B, proj_dim]
-        s = model.head(p.expand(d.shape[0], -1), d)          # [B]
+        s = model._score(p.expand(batch.shape[0], -1), batch)  # [B]
         scores.extend(float(x) for x in s.cpu().numpy())
     return scores
 
