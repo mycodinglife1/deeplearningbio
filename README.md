@@ -62,10 +62,39 @@ data/baseline_results.txt   baseline Pearson scores (mean 0.208)
 > The intensity matrix is stored **probe-major** (one line per probe, one value
 > per protein); `src/data/io.load_intensities` transposes it to
 > `[n_proteins, n_probes]`. Run `python scripts/inspect_data.py` to confirm.
+> (Data placement is only needed to *retrain*; it is **not** needed for grading.)
 
 ---
 
-## Reproduce end-to-end
+## Running the model (for grading — no training needed)
+
+**The trained model (`artifacts/model.pt`) and the precomputed protein embeddings
+(`artifacts/protein_embeddings.npz`) are already included.** There is nothing to
+train, download, or precompute — prediction reads these files directly. ESM-2 is
+**never** loaded at prediction time (no `transformers` import, no internet, no
+GPU required).
+
+The graded entrypoint scores one protein against a DNA probe file:
+
+```bash
+pip install -r requirements.txt          # one-time: torch, numpy, pyyaml
+
+# Score protein DBP1 for every probe in a DNA file (one score per line, in order)
+python main.py <output_file> <DBP_name> <DNA_probe_file>
+# e.g.
+python main.py DBP1.txt DBP1 data/test_seqs.txt
+```
+
+- `<DBP_name>` ∈ `DBP1`..`DBP64` (the 1-based line number in `test_DBPs.txt`).
+- Produce **all 64** score files + `submission.zip` at once: `python scripts/predict_all.py`
+- Time the full 64-DBP prediction (efficiency score): `python scripts/runtime_test.py`
+
+That is all the graders need to run. The section below is only for reproducing
+the model *from scratch* — **not required for grading.**
+
+---
+
+## Reproduce from scratch (optional — not needed for grading)
 
 ```bash
 # 0. Inspect the data and confirm the intensity format.
